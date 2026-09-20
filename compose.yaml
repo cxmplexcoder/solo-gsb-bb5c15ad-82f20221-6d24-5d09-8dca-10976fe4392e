@@ -9,4 +9,5 @@ services:
       MAX_FOLDS: "20"
       MAX_PUNCHES: "200"
       MAX_TOTAL_HOLES: "200000"
+      MAX_FOLD_CANDIDATES: "50"
     restart: unless-stopped

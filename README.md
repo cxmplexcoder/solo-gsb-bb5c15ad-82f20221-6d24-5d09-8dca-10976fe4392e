@@ -8,6 +8,8 @@
 
 另提供**反向打孔规划**接口：提交期望在展开板材上出现的目标孔位，服务端沿折叠过程将目标归并到最终折叠面的等价位置，并按最终叠层自上而下把组内目标映射为层号；当每组层号恰好构成连续前缀 `1..d` 时，该组用一个限深打孔点（`depth = d`，贯穿全部层时省略 `depth`）覆盖，复算校验后返回最小且唯一的打孔点列表。
 
+以及**折叠序列择优**接口：提交同一板材、目标孔位和若干候选折叠序列，服务端逐个复用反向打孔规划评估候选（奇数轴、非连续前缀、资源超限的候选记为不可行并返回结构化原因，不中断其余候选），对可行方案按**打孔点数 → 折叠步数 → 候选输入顺序**依次择优，返回选中索引、对应打孔计划及每个候选的评估摘要；重复候选只计算一次，但每个下标都保留评估结果。
+
 ## 快速开始
 
 只需一条命令（依赖随容器构建自动安装）：
@@ -20,7 +22,7 @@ docker compose up --build
 
 - API 交互文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
-- 业务接口：`POST http://localhost:8000/api/v1/unfold`（正向展开）、`POST http://localhost:8000/api/v1/punch-plan`（反向打孔规划）
+- 业务接口：`POST http://localhost:8000/api/v1/unfold`（正向展开）、`POST http://localhost:8000/api/v1/punch-plan`（反向打孔规划）、`POST http://localhost:8000/api/v1/fold-selection`（折叠序列择优）
 
 停止服务：`docker compose down`。
 
@@ -33,6 +35,7 @@ docker compose up --build
 | `MAX_FOLDS` | `20` | 单次请求允许的最大折叠步数 |
 | `MAX_PUNCHES` | `200` | 单次请求允许的最大打孔点数（对 `/punch-plan` 而言指归并后的打孔点数） |
 | `MAX_TOTAL_HOLES` | `200000` | 展开后孔位总数（打孔点数 × 2^折叠步数）上限 |
+| `MAX_FOLD_CANDIDATES` | `50` | `/fold-selection` 单次请求允许的最大候选折叠序列数 |
 
 端口映射在 `compose.yaml` 中为 `"8000:8000"`，如需修改对外端口，调整冒号左侧即可。
 
@@ -255,6 +258,115 @@ curl -X POST http://localhost:8000/api/v1/punch-plan \
     "group": { "x": 1, "y": 0 },
     "present_layers": [2],
     "missing_prefix_layers": [1]
+  }
+}
+```
+
+### `POST /api/v1/fold-selection`
+
+折叠序列择优：提交同一板材、一组目标孔位和若干**候选折叠序列**，服务端对每个候选复用 `/api/v1/punch-plan` 的层序与限深规则生成打孔计划；奇数轴（`odd_fold_axis`）、非连续前缀（`non_prefix_depth_group`）或资源超限（`limit_exceeded`）的候选记为**不可行**并返回结构化原因，**不中断其余候选**的评估。对可行方案按 **打孔点数 → 折叠步数 → 候选输入顺序** 依次择优，返回选中索引、对应打孔计划及每个候选的评估摘要。
+
+- 重复候选只计算一次，但每个下标都保留自己的评估结果（择优时先出现者胜出）。
+- 候选数量受 `MAX_FOLD_CANDIDATES`（默认 50）限制，超限返回 `400 limit_exceeded`。
+- 全部候选不可行时返回 `400 no_feasible_candidate`，`detail.candidates` 列出每个候选的完整原因。
+
+**请求体**
+
+```json
+{
+  "board": { "width": 8, "height": 4 },
+  "targets": [
+    { "x": 1, "y": 1 },
+    { "x": 1, "y": 2 },
+    { "x": 6, "y": 1 },
+    { "x": 6, "y": 2 }
+  ],
+  "candidates": [["left", "down"], ["left"], []]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `board` / `targets` | 同 `/api/v1/punch-plan` |
+| `candidates` | 候选折叠方向序列（按执行顺序给出），至少 1 个；单个序列可为空数组（不折叠），长度上限同 `folds` |
+
+**响应示例**（上面请求的返回）
+
+```json
+{
+  "board": { "width": 8, "height": 4 },
+  "selected_index": 0,
+  "plan": {
+    "folds": ["left", "down"],
+    "final_face": { "x": 0, "y": 2, "width": 4, "height": 2 },
+    "stack_layers": 4,
+    "target_count": 4,
+    "punch_count": 1,
+    "punches": [{ "x": 1, "y": 0 }]
+  },
+  "candidates": [
+    { "index": 0, "folds": ["left", "down"], "fold_count": 2, "feasible": true, "punch_count": 1 },
+    { "index": 1, "folds": ["left"], "fold_count": 1, "feasible": true, "punch_count": 2 },
+    { "index": 2, "folds": [], "fold_count": 0, "feasible": true, "punch_count": 4 }
+  ]
+}
+```
+
+| 响应字段 | 说明 |
+| --- | --- |
+| `selected_index` | 选中候选在请求 `candidates` 中的下标 |
+| `plan` | 选中候选对应的打孔计划，字段同 `/api/v1/punch-plan` 响应（附带 `folds`），`punches` 可直接作为 `/api/v1/unfold` 的 `punches` 使用 |
+| `candidates[]` | 每个候选的评估摘要（与请求顺序一致）：`fold_count` 为折叠步数；可行时带 `punch_count`，不可行时带结构化 `reason`（与 400 错误的 `detail` 同构，含 `error` / `message` 及上下文字段） |
+
+**curl 示例**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/fold-selection \
+  -H "Content-Type: application/json" \
+  -d '{
+    "board": {"width": 8, "height": 4},
+    "targets": [{"x": 1, "y": 1}, {"x": 1, "y": 2}, {"x": 6, "y": 1}, {"x": 6, "y": 2}],
+    "candidates": [["left", "down"], ["left"], []]
+  }'
+```
+
+**错误响应**
+
+- `400 no_feasible_candidate`：全部候选均不可行，`detail.candidates` 按输入顺序列出每个候选的下标、折叠序列与结构化原因。
+- `400 limit_exceeded`：候选数量超过 `MAX_FOLD_CANDIDATES`。
+- `422`：请求体不符合 schema（如空候选列表、空目标列表、非法方向）。
+
+```json
+{
+  "detail": {
+    "error": "no_feasible_candidate",
+    "message": "全部 2 个候选折叠序列均不可行。",
+    "candidates": [
+      {
+        "index": 0,
+        "folds": ["left"],
+        "reason": {
+          "error": "odd_fold_axis",
+          "message": "第 0 步折叠（'left'）要求当前宽度为偶数，实际为 3。",
+          "step": 0,
+          "direction": "left",
+          "axis": "width",
+          "axis_length": 3
+        }
+      },
+      {
+        "index": 1,
+        "folds": ["right"],
+        "reason": {
+          "error": "odd_fold_axis",
+          "message": "第 0 步折叠（'right'）要求当前宽度为偶数，实际为 3。",
+          "step": 0,
+          "direction": "right",
+          "axis": "width",
+          "axis_length": 3
+        }
+      }
+    ]
   }
 }
 ```
