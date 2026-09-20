@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    image: fold-unfold-api:latest
+    container_name: fold-unfold-api
+    ports:
+      - "8000:8000"
+    environment:
+      MAX_FOLDS: "20"
+      MAX_PUNCHES: "200"
+      MAX_TOTAL_HOLES: "200000"
+    restart: unless-stopped
