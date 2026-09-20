@@ -8,6 +8,8 @@
 
 另提供**反向打孔规划**接口：提交期望在展开板材上出现的目标孔位，服务端沿折叠过程将目标归并到最终折叠面的等价位置，并按最终叠层自上而下把组内目标映射为层号；当每组层号恰好构成连续前缀 `1..d` 时，该组用一个限深打孔点（`depth = d`，贯穿全部层时省略 `depth`）覆盖，复算校验后返回最小且唯一的打孔点列表。
 
+还提供**候选折叠序列择优**接口 `POST /api/v1/fold-selection`：同一板材与目标孔位下提交若干候选折叠序列，逐个复用反向规划规则，奇数轴、非连续前缀或资源超限的候选记为不可行并返回结构化原因（不中断其余候选）；可行方案按打孔点数、折叠步数、候选输入顺序依次择优。
+
 ## 快速开始
 
 只需一条命令（依赖随容器构建自动安装）：
@@ -16,13 +18,16 @@
 docker compose up --build
 ```
 
-启动后访问：
+服务监听容器内 **8000** 端口，`compose.yaml` 将宿主机 **8000** 端口映射到容器（`"8000:8000"`）。启动后访问：
 
 - API 交互文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
-- 业务接口：`POST http://localhost:8000/api/v1/unfold`（正向展开）、`POST http://localhost:8000/api/v1/punch-plan`（反向打孔规划）
+- 业务接口：
+  - `POST http://localhost:8000/api/v1/unfold`（正向展开）
+  - `POST http://localhost:8000/api/v1/punch-plan`（反向打孔规划）
+  - `POST http://localhost:8000/api/v1/fold-selection`（候选折叠序列批量评估择优）
 
-停止服务：`docker compose down`。
+停止服务：`docker compose down`。如需修改对外端口，调整 `compose.yaml` 端口映射冒号左侧即可。
 
 ## 配置
 
@@ -30,11 +35,10 @@ docker compose up --build
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MAX_FOLDS` | `20` | 单次请求允许的最大折叠步数 |
-| `MAX_PUNCHES` | `200` | 单次请求允许的最大打孔点数（对 `/punch-plan` 而言指归并后的打孔点数） |
+| `MAX_FOLDS` | `20` | 单次请求允许的最大折叠步数（`/fold-selection` 中超过该值的**单个候选**记为不可行） |
+| `MAX_PUNCHES` | `200` | 单次请求允许的最大打孔点数（对 `/punch-plan` 而言指归并后的打孔点数；`/fold-selection` 中超限候选记为不可行） |
 | `MAX_TOTAL_HOLES` | `200000` | 展开后孔位总数（打孔点数 × 2^折叠步数）上限 |
-
-端口映射在 `compose.yaml` 中为 `"8000:8000"`，如需修改对外端口，调整冒号左侧即可。
+| `MAX_FOLD_CANDIDATES` | `50` | `/fold-selection` 单次请求允许的候选折叠序列数 |
 
 ## API 说明
 
@@ -258,6 +262,156 @@ curl -X POST http://localhost:8000/api/v1/punch-plan \
   }
 }
 ```
+
+### `POST /api/v1/fold-selection`
+
+候选折叠序列批量评估择优：在**同一板材、同一组目标孔位**下提交若干候选折叠序列，服务端对每个候选**复用 `/api/v1/punch-plan` 的层序与限深规则**生成打孔计划；奇数折叠轴、目标层号非连续前缀或资源（`MAX_FOLDS` / `MAX_PUNCHES` / `MAX_TOTAL_HOLES`）超限的候选记为**不可行**并附结构化原因，**不中断**其余候选的评估。
+
+择优规则（按顺序比较）：
+
+1. **打孔点数更少**者优先；
+2. 打孔点数相同时，**折叠步数更少**者优先；
+3. 仍相同时，**候选输入顺序更靠前**者优先。
+
+其它约定：
+
+- 候选数受 `MAX_FOLD_CANDIDATES`（默认 `50`）限制，超过时整个请求返回 `400 limit_exceeded`。
+- **重复候选只计算一次**，但 `evaluations` 中每个下标都保留结果，重复项以 `duplicate_of` 指向首次出现的下标。
+- 目标孔位越界属于请求级错误，在评估任何候选前一次性返回 `400 target_out_of_bounds`。
+- 至少一个候选可行时返回 200：`selected_index` 为选中候选下标，顶层计划字段（`final_face` / `stack_layers` / `target_count` / `punch_count` / `punches` / `folds`）即该候选的打孔计划，可直接配合 `/api/v1/unfold` 使用；`evaluations` 为每个候选的评估摘要。
+- **全部候选不可行**时返回 400：`detail.error = all_candidates_infeasible`，`detail.reasons` 为与 `candidates` **等长、按下标对应**的完整原因列表（重复候选重复列出同一原因）。
+
+**请求体**
+
+```json
+{
+  "board": { "width": 8, "height": 4 },
+  "targets": [
+    { "x": 1, "y": 1 },
+    { "x": 1, "y": 2 },
+    { "x": 6, "y": 1 },
+    { "x": 6, "y": 2 }
+  ],
+  "candidates": [
+    ["left", "down"],
+    ["right", "up"],
+    ["left", "down"]
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `board` | 同 `/api/v1/unfold` |
+| `targets` | 期望孔位（原始板材坐标），至少 1 个，所有候选共享，自动去重 |
+| `candidates` | 候选折叠序列列表，每项同 `/api/v1/punch-plan` 的 `folds`（可为空序列 `[]`）；至少 1 项，数量受 `MAX_FOLD_CANDIDATES` 限制 |
+
+**响应示例**（上面请求的返回：下标 0 与 2 重复，只计算一次但两个下标都保留结果）
+
+```json
+{
+  "board": { "width": 8, "height": 4 },
+  "targets": [
+    { "x": 1, "y": 1 },
+    { "x": 1, "y": 2 },
+    { "x": 6, "y": 1 },
+    { "x": 6, "y": 2 }
+  ],
+  "selected_index": 0,
+  "final_face": { "x": 0, "y": 2, "width": 4, "height": 2 },
+  "stack_layers": 4,
+  "target_count": 4,
+  "punch_count": 1,
+  "punches": [{ "x": 1, "y": 0 }],
+  "folds": ["left", "down"],
+  "evaluations": [
+    { "index": 0, "feasible": true, "fold_count": 2, "punch_count": 1 },
+    { "index": 1, "feasible": true, "fold_count": 2, "punch_count": 1 },
+    { "index": 2, "feasible": true, "fold_count": 2, "punch_count": 1, "duplicate_of": 0 }
+  ]
+}
+```
+
+**评估摘要字段**（`evaluations[]`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `index` | 候选在请求 `candidates` 中的下标 |
+| `feasible` | 是否生成了可精确覆盖目标的打孔计划 |
+| `fold_count` | 该候选的折叠步数 |
+| `punch_count` | 可行时的打孔点数；不可行时省略 |
+| `duplicate_of` | 与更早下标重复时指向首次出现下标；否则省略 |
+| `reason` | 不可行时的结构化原因（字段同下方错误代码，复用各代码的 context）；可行时省略 |
+
+**不可行候选不中断评估的示例**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/fold-selection \
+  -H "Content-Type: application/json" \
+  -d '{
+    "board": {"width": 4, "height": 4},
+    "targets": [{"x": 0, "y": 0}],
+    "candidates": [["left", "left", "left"], ["left", "down"]]
+  }'
+```
+
+候选 0 在第 3 步遇到奇数轴（4→2→1）不可行，候选 1 可行，返回 200 且选中下标 1：
+
+```json
+{
+  "selected_index": 1,
+  "final_face": { "x": 0, "y": 2, "width": 2, "height": 2 },
+  "stack_layers": 4,
+  "target_count": 1,
+  "punch_count": 1,
+  "punches": [{ "x": 0, "y": 1, "depth": 1 }],
+  "folds": ["left", "down"],
+  "evaluations": [
+    {
+      "index": 0,
+      "feasible": false,
+      "fold_count": 3,
+      "reason": {
+        "error": "odd_fold_axis",
+        "message": "第 2 步折叠（'left'）要求当前宽度为偶数，实际为 1。",
+        "step": 2,
+        "direction": "left",
+        "axis": "width",
+        "axis_length": 1
+      }
+    },
+    { "index": 1, "feasible": true, "fold_count": 2, "punch_count": 1 }
+  ]
+}
+```
+
+**全部不可行时的 400 响应**
+
+```json
+{
+  "detail": {
+    "error": "all_candidates_infeasible",
+    "message": "全部 2 个候选折叠序列均不可行，详见 reasons 中与 candidates 等长的结构化原因列表。",
+    "reasons": [
+      { "error": "odd_fold_axis", "message": "…", "step": 2, "direction": "left", "axis": "width", "axis_length": 1 },
+      {
+        "error": "non_prefix_depth_group",
+        "message": "…",
+        "group": { "x": 1, "y": 0 },
+        "present_layers": [2],
+        "missing_prefix_layers": [1]
+      }
+    ]
+  }
+}
+```
+
+**错误响应**
+
+- `400 all_candidates_infeasible`：全部候选不可行，`detail.reasons` 与 `candidates` 等长，逐个给出原因（`odd_fold_axis` / `non_prefix_depth_group` / `limit_exceeded`，字段同各自在 `/api/v1/punch-plan` 的 context）。
+- `400 limit_exceeded`：候选数超过 `MAX_FOLD_CANDIDATES`（请求级；单候选超 `MAX_FOLDS` 等上限则只标记该候选不可行）。
+- `400 target_out_of_bounds`：共享目标含越界坐标（请求级）。
+- `422`：请求体不符合 schema（如空候选 / 空目标列表、非法方向、负坐标、单条序列超过 64 步）。
 
 ## 本地开发（不用 Docker）
 

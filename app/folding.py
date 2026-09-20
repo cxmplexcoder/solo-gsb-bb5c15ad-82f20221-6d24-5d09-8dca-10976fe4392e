@@ -256,6 +256,28 @@ def fold_point(regions: list[Region], folds: list[str], x: int, y: int) -> tuple
     return fold_point_layer(regions, folds, x, y)[0]
 
 
+def ensure_targets_in_bounds(
+    width: int, height: int, unique_targets: list[tuple[int, int]]
+) -> None:
+    """校验（已去重的）目标孔位均位于板材内。
+
+    越界时抛出 FoldError("target_out_of_bounds")，context 的 out_of_bounds
+    按 (x, y) 顺序列出全部越界点。plan_punches 与候选序列批量评估共用本校验。
+    """
+    out_of_bounds = [
+        (x, y) for x, y in unique_targets if not (0 <= x < width and 0 <= y < height)
+    ]
+    if out_of_bounds:
+        raise FoldError(
+            "target_out_of_bounds",
+            f"目标孔位包含 {len(out_of_bounds)} 个越界坐标"
+            f"（板材 {width}x{height}，坐标从 0 开始）。",
+            out_of_bounds=[{"x": x, "y": y} for x, y in out_of_bounds],
+            board_width=width,
+            board_height=height,
+        )
+
+
 def plan_punches(
     width: int,
     height: int,
@@ -292,18 +314,7 @@ def plan_punches(
     # 目标孔位去重，统一按 (x, y) 排序保证后续处理顺序稳定
     unique_targets = sorted(set(targets))
 
-    out_of_bounds = [
-        (x, y) for x, y in unique_targets if not (0 <= x < width and 0 <= y < height)
-    ]
-    if out_of_bounds:
-        raise FoldError(
-            "target_out_of_bounds",
-            f"目标孔位包含 {len(out_of_bounds)} 个越界坐标"
-            f"（板材 {width}x{height}，坐标从 0 开始）。",
-            out_of_bounds=[{"x": x, "y": y} for x, y in out_of_bounds],
-            board_width=width,
-            board_height=height,
-        )
+    ensure_targets_in_bounds(width, height, unique_targets)
 
     # 沿折叠过程正向归并：等价组（折叠面局部坐标）-> 组内目标占有的层号集合
     layers_by_punch: dict[tuple[int, int], set[int]] = {}

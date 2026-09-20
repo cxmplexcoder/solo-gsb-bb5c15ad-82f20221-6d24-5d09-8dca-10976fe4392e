@@ -3,6 +3,7 @@ import pytest
 
 from app.folding import (
     FoldError,
+    ensure_targets_in_bounds,
     fold_point,
     fold_point_layer,
     fold_regions,
@@ -370,3 +371,18 @@ def test_plan_punches_limit_exceeded():
     with pytest.raises(FoldError) as exc_info:
         plan_punches(4, 4, ["left"], [(0, 0), (1, 0)], max_total_holes=3)
     assert exc_info.value.code == "limit_exceeded"
+
+
+def test_ensure_targets_in_bounds_accepts_valid():
+    ensure_targets_in_bounds(4, 4, [(0, 0), (3, 3)])  # 不抛异常即可
+
+
+def test_ensure_targets_in_bounds_lists_all_sorted():
+    # 调用方负责预先排序；helper 保持入参顺序（plan_punches 传入的就是排序后列表）
+    with pytest.raises(FoldError) as exc_info:
+        ensure_targets_in_bounds(4, 4, [(0, 4), (9, 0)])
+    err = exc_info.value
+    assert err.code == "target_out_of_bounds"
+    assert err.context["out_of_bounds"] == [{"x": 0, "y": 4}, {"x": 9, "y": 0}]
+    assert err.context["board_width"] == 4
+    assert err.context["board_height"] == 4
